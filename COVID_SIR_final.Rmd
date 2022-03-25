@@ -1,0 +1,246 @@
+---
+title: "COVID_case_estimation"
+author: "Jonathan Moul"
+date: "5/24/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This document contains our attempt at an SIR model, together with the 'COVID_SIR.stan'
+file. Note that to use this file, you need to manually alter the lines that set the directory and the filenames to read from (in the 'Preliminaries' and 'Data Processing' sections). 
+
+## Preliminaries
+
+```{r}
+# Clear environment and set directory
+rm(list=ls())
+setwd("C:/Users/Jonathan/Documents/School Work/CS156b")
+
+# Import data
+county_totals = read.delim('nyt_us_counties.csv.txt', header=TRUE, sep=',', dec=".")
+county_totals = county_totals[complete.cases(county_totals),]
+county_pops = read.delim('county_populations.csv.txt', header=TRUE, sep=',', dec=".")
+county_pops = county_pops[complete.cases(county_pops),]
+
+# Load relevant libraries and ready parallel computing
+library(rstan)
+library(ggplot2)
+library(bayesplot)
+library(stringr)
+library(rlist)
+library(dplyr)
+options(mc.cores = parallel::detectCores()) 
+```
+
+# Data Processing
+
+We import the data. Then, we separate out counties with strict restaurant regulations over
+the entire period from 4/5/20 to 5/10/20 and those with lax restaurant regulations over
+the same period. We run our stan code on the summed case counts and population for each
+group of counties and observe the differences between the posterior estimates of the
+epidemiological parameters of the two groups.
+
+```{r}
+# Import the data
+setwd("C:/Users/Jonathan/Documents/School Work/CS156b")
+rests = read.delim('cdc_restaurant_orders2.txt', header=TRUE, sep=',', dec=".",
+                   colClasses=c('character'))
+rests = rests[complete.cases(rests),]
+```
+
+```{r}
+# Process the data
+# Combine the state and county FIPS
+rests['fips'] = paste0(rests[,1], str_pad(rests[,2], 3, 'left', '0'))
+# Change the classes of some columns
+rests['date'] = as.Date(rests[,3], format='%m/%d/%Y')
+rests['order_code'] = as.numeric(rests[,4])
+```
+
+```{r}
+# Narrow our temporal window
+now_rests = rests[rests['date'] > '2020-03-19' & rests['date'] < '2020-05-11']
+dim(now_rests) = c(length(now_rests)/6, 6)
+
+# Isolate the counties with harsh responses
+harsh_fips = list()
+lax_fips = list()
+all_fips = unique(now_rests[,6])
+for (curr_fips in all_fips) {
+    # Get the table of only this fips
+    curr_data = now_rests[now_rests[,6] == curr_fips,]
+    dim(curr_data) = c(length(curr_data)/6, 6)
+    colnames(curr_data) = c('fips_state', 'fips_county', 'date', 'code', 'state', 'fips')
+    curr_data[,4] = as.numeric(curr_data[,4])
+    if (min(curr_data[,4]) > 3) {
+        harsh_fips = list.append(harsh_fips, curr_fips)
+    }
+    if (max(curr_data[,4]) < 4) {
+        lax_fips = list.append(lax_fips, curr_fips)
+    } 
+}
+```
+
+```{r}
+# Next, join the harsh_fips and lax_fips with their populations and cases
+harsh_rests = now_rests[is.element(now_rests[,6], harsh_fips),]
+colnames(harsh_rests) = colnames(rests)
+lax_rests = now_rests[is.element(now_rests[,6], lax_fips),]
+colnames(lax_rests) = colnames(rests)
+harsh = merge(harsh_rests, county_totals, by.x=c('fips', 'date'), by.y=c('fips', 'date'))
+harsh = merge(harsh, county_pops, by.x='fips', by.y='FIPS')
+lax = merge(lax_rests, county_totals, by.x=c('fips', 'date'), by.y=c('fips', 'date'))
+lax = merge(lax, county_pops, by.x='fips', by.y='FIPS')
+```
+
+
+```{r}
+# Collate the harsh and lax tables by date
+harsh = harsh[harsh['date'] > '2020-04-05' & harsh['date'] < '2020-05-11',]
+lax = lax[lax['date'] > '2020-04-05' & lax['date'] < '2020-05-11',]
+
+harsh_cases = harsh %>%
+    group_by(date) %>%
+    summarize(case_sum = sum(cases), pop_sum = sum(total_pop)) %>%
+    pull(var=2)
+harsh_pops = harsh %>%
+    group_by(date) %>%
+    summarize(case_sum = sum(cases), pop_sum = sum(total_pop)) %>%
+    pull(var=3)
+harsh_pop = max(harsh_pops)
+lax_cases = lax %>%
+    group_by(date) %>%
+    summarize(case_sum = sum(cases), pop_sum = sum(total_pop)) %>%
+    pull(var=2)
+lax_pops = lax %>%
+    group_by(date) %>%
+    summarize(case_sum = sum(cases), pop_sum = sum(total_pop)) %>%
+    pull(var=3)
+lax_pop = max(lax_pops)
+```
+
+## Calculation and Analysis for Harsh Policy Group
+
+```{r}
+# Use stan on harsh_cases
+N = length(harsh_cases)
+
+# Input the data to stan
+harsh_fit = stan('COVID_SIR.stan', iter = 25000, chains = 4,
+           data = list(N=N, R_init=0, cases=harsh_cases, pop=harsh_pop))
+
+# Print fitted model
+print(harsh_fit)
+```
+
+We observe that the convergence behavior is very poor. This indicates that we should
+likely try a variation of the model that needs to fit fewer parameters.
+
+```{r}
+# Get the results of the fit
+harsh_fit_results = extract(harsh_fit)
+
+# Record the mean sampled values of each parameter
+harsh_I_init = mean(harsh_fit_results[['I_init']])
+harsh_S_init = mean(harsh_fit_results[['S_init']])
+harsh_gamma = mean(harsh_fit_results[['gamma']])
+harsh_beta = mean(harsh_fit_results[['beta']])
+harsh_I_vals = colMeans(harsh_fit_results[['I_vals']])
+harsh_S_vals = colMeans(harsh_fit_results[['S_vals']])
+harsh_R_vals = colMeans(harsh_fit_results[['R_vals']])
+harsh_case_vals = colMeans(harsh_fit_results[['case_vals']])
+
+# Plot the mean posterior values against the actual case numbers
+x_vals = 1:N
+pts = data.frame(x_vals, harsh_case_vals, harsh_cases)
+ggplot(pts, aes(x=x_vals)) + 
+    geom_line(aes(y=harsh_case_vals), color='blue') +
+    geom_line(aes(y=harsh_cases), color='red') +
+    ggtitle('Harsh Mean Posterior Fitted Cases vs Actual Cases') +
+    xlab('Day from 4/10/20') +
+    ylab('Number of People') +
+    theme(legend.position = 'upper right')
+```
+
+```{r}
+# Plot R_0 over time
+x_vals = 1:N
+harsh_r_0 = harsh_beta*harsh_S_vals/harsh_gamma
+pts = data.frame(x_vals, harsh_r_0)
+ggplot(pts, aes(x=x_vals)) + 
+    geom_line(aes(y=harsh_r_0), color='blue') +
+    ggtitle('Harsh R_0 Over Time') +
+    xlab('Day from 4/10/20') +
+    ylab('Est R_0') +
+    theme(legend.position = 'upper right')
+```
+
+## Calculation and Analysis for Lax Policy Group
+
+```{r}
+# Use stan on lax_cases
+N = length(lax_cases)
+
+# Input the data to stan
+lax_fit = stan('COVID_SIR.stan', iter = 25000, chains = 4,
+           data = list(N=N, R_init=0, cases=lax_cases, pop=lax_pop))
+
+# Print fitted model
+print(lax_fit)
+```
+
+Once again, the convergence behavior is very poor, indicating that we should
+likely try a variation of the model that needs to fit fewer parameters.
+
+```{r}
+# Get the results of the fit
+lax_fit_results = extract(lax_fit)
+
+# Record the mean sampled values of each parameter
+lax_I_init = mean(lax_fit_results[['I_init']])
+lax_S_init = mean(lax_fit_results[['S_init']])
+lax_gamma = mean(lax_fit_results[['gamma']])
+lax_beta = mean(lax_fit_results[['beta']])
+lax_I_vals = colMeans(lax_fit_results[['I_vals']])
+lax_S_vals = colMeans(lax_fit_results[['S_vals']])
+lax_R_vals = colMeans(lax_fit_results[['R_vals']])
+lax_case_vals = colMeans(lax_fit_results[['case_vals']])
+
+# Plot the mean posterior values against the actual case numbers
+x_vals = 1:N
+pts = data.frame(x_vals, lax_case_vals, lax_cases)
+ggplot(pts, aes(x=x_vals)) + 
+    geom_line(aes(y=lax_case_vals), color='blue') +
+    geom_line(aes(y=lax_cases), color='red') +
+    ggtitle('Lax Mean Posterior Fitted Cases vs Actual Cases') +
+    xlab('Day from 4/10/20') +
+    ylab('Number of People') +
+    theme(legend.position = 'upper right')
+```
+
+```{r}
+# Plot R_0 over time
+x_vals = 1:N
+lax_r_0 = lax_beta*lax_S_vals/lax_gamma
+pts = data.frame(x_vals, lax_r_0)
+ggplot(pts, aes(x=x_vals)) + 
+    geom_line(aes(y=lax_r_0), color='blue') +
+    ggtitle('Lax R_0 Over Time') +
+    xlab('Day from 4/10/20') +
+    ylab('Est R_0') +
+    theme(legend.position = 'upper right')
+```
+
+## Conclusion
+
+Although the poor convergence diagnostics and the fitted curves' lack of resemblance to
+the data indicate that any conclusions from this model are extremely tenuous at best, the
+order of magnitude difference in the calculated reproduction constants R_0, as well as
+the decrease of R_0 well below the reproductive threshhold of 1.0 for the counties with
+harsh policies, indicate that a more thoughtfully constructed model of this type may
+hold promise.
